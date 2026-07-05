@@ -4,7 +4,7 @@ on:
   workflow_dispatch:
     inputs:
       backends:
-        description: Comma-separated backends to prune (e.g. "rocm-7beta,rocm-7rc") or "all"
+        description: Comma-separated backends to prune (e.g. "vulkan-radv-slot-checkpoints") or "all"
         default: all
       keep:
         description: Number of latest tags to keep
@@ -12,31 +12,23 @@ on:
   workflow_run:
     workflows: ["Build & Publish AMD Strix Halo Toolboxes"]
     types: [completed]   # runs after success/failure/cancel
-    branches: [main]     
+    branches: [main]
+
+permissions:
+  contents: read
+  packages: write
 
 jobs:
   prune:
     runs-on: ubuntu-latest
     env:
-      NS: kyuz0
-      REPO: amd-strix-halo-toolboxes
+      # GHCR package is linked to this repo (pushed via GITHUB_TOKEN), so the
+      # built-in token can list & delete its versions with packages: write.
+      OWNER: ${{ github.repository_owner }}
+      PACKAGE: amd-strix-halo-toolboxes
     steps:
       - name: Install jq
         run: sudo apt-get update && sudo apt-get install -y jq
-
-      - name: Login to Docker Hub API (JWT)
-        id: login
-        env:
-          DH_USER: ${{ secrets.DOCKERHUB_USERNAME }}
-          DH_PASS: ${{ secrets.DOCKERHUB_TOKEN }}
-        run: |
-          TOKEN=$(curl -s -H "Content-Type: application/json" \
-            -d "{\"username\":\"${DH_USER}\",\"password\":\"${DH_PASS}\"}" \
-            https://hub.docker.com/v2/users/login/ | jq -r .token)
-          if [[ -z "$TOKEN" || "$TOKEN" == "null" ]]; then
-            echo "Failed to get Docker Hub JWT"; exit 1
-          fi
-          echo "token=${TOKEN}" >> "$GITHUB_OUTPUT"
 
       - name: Determine backend list
         id: mk
@@ -44,45 +36,65 @@ jobs:
         run: |
           IN='${{ github.event.inputs.backends }}'
           if [[ "$IN" == "all" || -z "$IN" ]]; then
-            JSON='["rocm-6.4.2","rocm-6.4.3","rocm-6.4.4","rocm-7.1.1","rocm-7.2","rocm-7.2.1","rocm-7.2.1-pr21344","rocm-7.2.2","rocm-7.2.3","rocm-7.2.3-mtp","rocm-7beta","rocm7-nightlies","vulkan-amdvlk","vulkan-radv","vulkan-radv-mtp"]'
+            JSON='["vulkan-radv-slot-checkpoints"]'
           else
             IN_CLEAN=$(echo "$IN" | tr -d '[:space:]')
             JSON='["'${IN_CLEAN//,/\",\"}'"]'
           fi
           echo "list=${JSON}" >> "$GITHUB_OUTPUT"
 
-      - name: Prune old tags
+      - name: Prune old versions
         env:
-          TOKEN: ${{ steps.login.outputs.token }}
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           KEEP: ${{ github.event.inputs.keep }}
+        shell: bash
         run: |
+          set -euo pipefail
+          KEEP="${KEEP:-3}"
           BACKENDS='${{ steps.mk.outputs.list }}'
           mapfile -t ARR < <(jq -r '.[]' <<< "$BACKENDS")
-          base_url="https://hub.docker.com/v2/repositories/${NS}/${REPO}/tags"
-          auth_hdr="Authorization: JWT ${TOKEN}"
+
+          OWNER_LC="${OWNER,,}"
+          api="https://api.github.com"
+          auth_hdr="Authorization: Bearer ${GH_TOKEN}"
+          accept_hdr="Accept: application/vnd.github+json"
+          versions_url="${api}/users/${OWNER_LC}/packages/container/${PACKAGE}/versions"
+
+          # Collect every package version (id, created_at, tags) across all pages.
+          all_versions="$(mktemp)"
+          page=1
+          while : ; do
+            resp=$(curl -fsSL -H "$auth_hdr" -H "$accept_hdr" \
+              "${versions_url}?per_page=100&page=${page}")
+            count=$(jq 'length' <<< "$resp")
+            (( count == 0 )) && break
+            jq -c '.[] | {id: .id, created_at: .created_at, tags: (.metadata.container.tags // [])}' \
+              <<< "$resp" >> "$all_versions"
+            (( count < 100 )) && break
+            page=$((page+1))
+          done
 
           for B in "${ARR[@]}"; do
             echo ""
             echo "=== Backend: ${B} (keeping latest ${KEEP}) ==="
-            next="${base_url}?page_size=100&ordering=last_updated&name=${B}_"
-            tags=()
-            while [[ -n "$next" && "$next" != "null" ]]; do
-              resp=$(curl -s -H "$auth_hdr" "$next")
-              page_tags=($(jq -r '.results[].name' <<< "$resp" | grep -E "^${B}_" || true))
-              tags+=("${page_tags[@]}")
-              next=$(jq -r '.next' <<< "$resp")
-            done
-            total=${#tags[@]}
-            echo "Found ${total} immutable tag(s) for ${B}."
+            # Immutable version tags look like "<backend>_<timestamp>"; the moving
+            # channel tag "<backend>" rides on the newest version, so it stays safe.
+            mapfile -t IDS < <(
+              jq -s -r --arg b "${B}_" \
+                'map(select(.tags | any(startswith($b)))) | sort_by(.created_at) | reverse | .[].id' \
+                "$all_versions"
+            )
+            total=${#IDS[@]}
+            echo "Found ${total} immutable version(s) for ${B}."
             if (( total <= KEEP )); then
               echo "Nothing to delete."
               continue
             fi
-            to_delete=("${tags[@]:KEEP}")
-            for t in "${to_delete[@]}"; do
-              echo "Deleting tag ${t}..."
-              curl -s -X DELETE -H "$auth_hdr" \
-                "https://hub.docker.com/v2/repositories/${NS}/${REPO}/tags/${t}/" \
+            to_delete=("${IDS[@]:KEEP}")
+            for id in "${to_delete[@]}"; do
+              echo "Deleting version ${id}..."
+              curl -s -X DELETE -H "$auth_hdr" -H "$accept_hdr" \
+                "${versions_url}/${id}" \
                 -o /dev/null -w "%{http_code}\n" | grep -Eq "^(202|204)$" \
                 && echo "✔ Deleted" || echo "✖ Failed"
             done
