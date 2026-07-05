@@ -71,6 +71,7 @@ These are experimental or custom builds. They are not rebuilt automatically on e
 | `rocm-7.2.4-rocmfp4` | ROCm 7.2.4 (Custom) | Custom `charlie12345/rocmfp4-llama` build supporting ROCmFP4 tensor types and draft-MTP. Manual build only. |
 | `rocm-7.2.4-turboquant` | ROCm 7.2.4 (Custom) | Custom TurboQuant build for AMD Strix Halo. Manual build only. |
 | `rocm7-nightlies` | ROCm 7 Nightly | Tracks ROCm nightly builds. Includes patch for **kernel 6.18.4+** support. *Warning: currently has memory limit bug.* |
+| `vulkan-radv-slot-checkpoints` | Vulkan (Mesa RADV) | Same as `vulkan-radv`, plus [PR #20819](https://github.com/ggml-org/llama.cpp/pull/20819): persists context checkpoints across `/slots` save/restore so hybrid/recurrent models (Qwen3.5, Jamba, Falcon-H1) keep their cache across a model swap instead of re-processing the whole prompt. Manual build only. |
 
 > Legacy images (`rocm-6.4.2`, `rocm-6.4.3`, `rocm-7.1.1`) are excluded from these lists.
 
