@@ -16,11 +16,13 @@ ARG BRANCH=master
 RUN git clone -b ${BRANCH} --single-branch --recursive ${REPO} .
 
 COPY llama-grammar.patch /tmp/llama-grammar.patch
+COPY vulkan-radv-fa.patch /tmp/vulkan-radv-fa.patch
 
 # build
 RUN git clean -xdf \
   && git submodule update --recursive \
   && patch -p1 < /tmp/llama-grammar.patch \
+  && patch -p1 < /tmp/vulkan-radv-fa.patch \
   && cmake -S . -B build -G Ninja \
   -DGGML_VULKAN=ON \
   -DCMAKE_BUILD_TYPE=Release \

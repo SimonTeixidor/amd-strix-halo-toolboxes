@@ -17,12 +17,14 @@ RUN git clone -b ${BRANCH} --single-branch --recursive ${REPO} .
 
 COPY llama-grammar.patch /tmp/llama-grammar.patch
 COPY slot-checkpoints.patch /tmp/slot-checkpoints.patch
+COPY vulkan-radv-fa.patch /tmp/vulkan-radv-fa.patch
 
 # build
 RUN git clean -xdf \
   && git submodule update --recursive \
   && patch -p1 < /tmp/llama-grammar.patch \
   && patch -p1 < /tmp/slot-checkpoints.patch \
+  && patch -p1 < /tmp/vulkan-radv-fa.patch \
   && cmake -S . -B build -G Ninja \
   -DGGML_VULKAN=ON \
   -DCMAKE_BUILD_TYPE=Release \
