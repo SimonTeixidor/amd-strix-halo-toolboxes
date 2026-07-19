@@ -7,6 +7,7 @@ import tempfile
 import subprocess
 import time
 import signal
+import shlex
 from pathlib import Path
 
 # --- Configuration & Defaults ---
@@ -14,9 +15,15 @@ SCRIPT_DIR = Path(__file__).parent.resolve()
 DEFAULT_MODELS_DIR = Path.home() / "models"
 CONFIG_FILE = Path.home() / ".config" / "strix-halo-distributed-llama.json"
 DEFAULT_TOOLBOX = "rocm-7.2.4"
+DEFAULT_BENCH_PREFILL = "0,8192,16384,24576,32768,40960,49152,57344,65536"
+PREVIOUS_BENCH_PREFILL = "8192,16384,24576,32768,40960,49152,57344,65536"
+LEGACY_BENCH_PREFILL = "512,8192,16384,32768,65536"
+DEFAULT_BENCH_PREFILL_CHUNK = 2048
+DEFAULT_BENCH_UBATCH = 2048
 TOOLBOX_IMAGES = {
     "rocm-6.4.4": "llama-rocm-6.4.4",
     "rocm-7.2.4": "llama-rocm-7.2.4",
+    "rocm-7.2.4-rdma-fix": "llama-rocm-7.2.4-rdma-fix",
     "vulkan-amdvlk": "llama-vulkan-amdvlk",
     "vulkan-radv": "llama-vulkan-radv",
 }
@@ -33,6 +40,8 @@ DEFAULT_HOSTS = [
 
 REMOTE_PORT = os.getenv("REMOTE_PORT", "22")
 RPC_PORT = os.getenv("RPC_PORT", "50052")
+RDMA_DEV = os.getenv("GGML_RDMA_DEV", "")
+RDMA_GID = os.getenv("GGML_RDMA_GID", "")
 LOCAL_HOST_PORT = "8080"
 
 
@@ -145,9 +154,11 @@ class AppState:
         # List of [ip, enabled]
         self.hosts = [list(h) for h in DEFAULT_HOSTS]
         self.context_size = None # None means default (do not pass -c)
-        self.bench_prefill = "512,8192,16384,32768,65536" # Default bench prefill curve
+        self.bench_prefill = DEFAULT_BENCH_PREFILL
         self.bench_gen = "128" # Default generation lengths
+        self.bench_ubatch = DEFAULT_BENCH_UBATCH
         self.kv_cache_quant = None  # None = off, "q8_0" or "q4_0"
+        self.rpc_debug = True
         self.extra_args = "--jinja"  # Extra CLI arguments passed to the executable
         self.bench_extra_args = ""
         self.load_config()
@@ -166,7 +177,9 @@ class AppState:
             "context_size": self.context_size,
             "bench_prefill": self.bench_prefill,
             "bench_gen": self.bench_gen,
+            "bench_ubatch": self.bench_ubatch,
             "kv_cache_quant": self.kv_cache_quant,
+            "rpc_debug": self.rpc_debug,
             "extra_args": self.extra_args,
             "bench_extra_args": self.bench_extra_args,
         }
@@ -224,14 +237,27 @@ class AppState:
         if kv is None or (isinstance(kv, str) and kv in KV_CACHE_QUANT_VALUES):
             self.kv_cache_quant = kv
 
+        rd = data.get("rpc_debug")
+        if isinstance(rd, bool):
+            self.rpc_debug = rd
+
         # Bench prefill
         bp = data.get("bench_prefill")
         if bp is not None:
-            self.bench_prefill = str(bp)
+            saved_prefill = str(bp)
+            self.bench_prefill = (
+                DEFAULT_BENCH_PREFILL
+                if saved_prefill in (LEGACY_BENCH_PREFILL, PREVIOUS_BENCH_PREFILL)
+                else saved_prefill
+            )
 
         bg = data.get("bench_gen")
         if bg is not None:
             self.bench_gen = str(bg)
+
+        bu = data.get("bench_ubatch")
+        if isinstance(bu, int) and bu > 0:
+            self.bench_ubatch = bu
 
         # Extra args
         ea = data.get("extra_args")
@@ -290,10 +316,10 @@ def select_context(state):
     if state.mode == "llama-bench":
         current_p = str(state.bench_prefill) if state.bench_prefill else ""
         selection_p, code_p = run_dialog([
-            "--title", "Bench Prefill Sizes (pp)",
-            "--inputbox", "Enter prompt processing sizes separated by comma (e.g. 512,8192,16384).\n"
-            "Each value creates a separate -pp test.\n"
-            "Leave empty to skip:", "12", "68",
+            "--title", "Benchmark Starting Depths",
+            "--inputbox", "Enter starting KV depths separated by commas (e.g. 0,8192,16384).\n"
+            "At each depth, measure a 2048-token prefill and 128-token generation separately.",
+            "12", "76",
             current_p
         ])
         if code_p == 0:
@@ -311,6 +337,17 @@ def select_context(state):
             if code_n == 0:
                 val_n = selection_n.strip()
                 state.bench_gen = val_n if val_n else None
+
+                selection_ub, code_ub = run_dialog([
+                    "--title", "Bench Ubatch",
+                    "--inputbox", "Enter the physical batch size (-ub).\n"
+                    "Default: 2048", "10", "55",
+                    str(state.bench_ubatch)
+                ])
+                if code_ub == 0:
+                    val_ub = selection_ub.strip()
+                    if val_ub.isdigit() and int(val_ub) > 0:
+                        state.bench_ubatch = int(val_ub)
     else:
         current = str(state.context_size) if state.context_size else ""
         selection, code = run_dialog([
@@ -502,6 +539,21 @@ def run_distributed(state):
         show_msg("Error", "No remote servers selected.")
         return
 
+    bench_depths = []
+    if state.mode == "llama-bench":
+        try:
+            bench_depths = [
+                int(value.strip())
+                for value in str(state.bench_prefill).split(",")
+                if value.strip()
+            ]
+        except ValueError:
+            show_msg("Error", "Benchmark starting depths must be comma-separated integers.")
+            return
+        if not bench_depths or any(depth < 0 for depth in bench_depths):
+            show_msg("Error", "Benchmark starting depths must be zero or positive.")
+            return
+
     image = TOOLBOX_IMAGES[state.toolbox]
     active_ips = state.active_hosts
     
@@ -513,9 +565,11 @@ def run_distributed(state):
     print(f"Mode:    {state.mode}")
     
     if state.mode == "llama-bench":
-        p_val = state.bench_prefill if state.bench_prefill else "skip"
         n_val = state.bench_gen if state.bench_gen else "skip"
-        context_val = f"pg pairs: P=[{p_val}], N={n_val}"
+        context_val = (
+            f"depths=[{','.join(map(str, bench_depths))}], "
+            f"prefill={DEFAULT_BENCH_PREFILL_CHUNK}, generation={n_val}"
+        )
     else:
         context_val = state.context_size
     print(f"Context/Prefill: {context_val if context_val else 'Default'}")
@@ -524,6 +578,9 @@ def run_distributed(state):
     current_extra_args = state.bench_extra_args if state.mode == "llama-bench" else state.extra_args
     print(f"Extra:   {current_extra_args if current_extra_args else '(none)'}")
     print(f"Hosts:   {active_ips}")
+    print(f"RPC Debug: {'On' if state.rpc_debug else 'Off'}")
+    if RDMA_DEV or RDMA_GID:
+        print(f"RDMA Override: device={RDMA_DEV or 'auto'}, GID={RDMA_GID or 'auto'}")
     print("--------------------------------")
 
     remote_pids = []
@@ -536,7 +593,7 @@ def run_distributed(state):
                 if pid:
                     print(f"Killing remote RPC on {ip} (PID: {pid})...")
                     subprocess.run(
-                        ["ssh", "-p", REMOTE_PORT, ip, f"kill -9 {pid} 2>/dev/null || true; pkill -9 -f rpc-server || true"], 
+                        ["ssh", "-p", REMOTE_PORT, ip, f"kill -9 {pid} 2>/dev/null || true; pkill -9 -f ggml-rpc-server || true"], 
                         stderr=subprocess.DEVNULL
                     )
 
@@ -552,13 +609,21 @@ def run_distributed(state):
         # 1. Start Remote RPC Servers
         for ip in active_ips:
             print(f"-> Starting RPC server on {ip}...")
+            rpc_env = []
+            if state.rpc_debug:
+                rpc_env.append("GGML_RPC_DEBUG=1")
+            if RDMA_DEV:
+                rpc_env.append(f"GGML_RDMA_DEV={RDMA_DEV}")
+            if RDMA_GID:
+                rpc_env.append(f"GGML_RDMA_GID={RDMA_GID}")
+            rpc_env_prefix = "env " + " ".join(shlex.quote(value) for value in rpc_env) + " " if rpc_env else ""
             
             # Using bash heredoc via ssh to start background process and print PID
             # We assume 'toolbox' command exists on remote
             cmd_str = f"""
             set -euo pipefail
-            pkill -9 -f rpc-server || true
-            nohup toolbox run -c {image} -- rpc-server -H 0.0.0.0 -p {RPC_PORT} -c > /tmp/rpc-server-{ip}.log 2>&1 < /dev/null &
+            pkill -9 -f ggml-rpc-server || true
+            nohup toolbox run -c {image} -- {rpc_env_prefix}ggml-rpc-server -H 0.0.0.0 -p {RPC_PORT} -c > /tmp/ggml-rpc-server-{ip}.log 2>&1 < /dev/null &
             echo $!
             """
             
@@ -585,6 +650,7 @@ def run_distributed(state):
                 
             remote_pids.append(pid)
             print(f"   PID: {pid}")
+            print(f"   Debug log: ssh -p {REMOTE_PORT} {ip} 'tail -f /tmp/ggml-rpc-server-{ip}.log'")
 
             # Wait for port check
             print(f"   Waiting for port {RPC_PORT}...", end="", flush=True)
@@ -618,7 +684,19 @@ def run_distributed(state):
         # 2. Run Local Executable
         # Base arguments for all modes
         base_args = [
-            "toolbox", "run", "-c", image, "--",
+            "toolbox", "run", "-c", image, "--"
+        ]
+        if state.rpc_debug:
+            base_args += ["env", "GGML_RPC_DEBUG=1"]
+        if RDMA_DEV:
+            if "env" not in base_args:
+                base_args.append("env")
+            base_args.append(f"GGML_RDMA_DEV={RDMA_DEV}")
+        if RDMA_GID:
+            if "env" not in base_args:
+                base_args.append("env")
+            base_args.append(f"GGML_RDMA_GID={RDMA_GID}")
+        base_args += [
             state.mode,
             "-m", state.model_path,
             "--rpc", rpc_arg
@@ -648,15 +726,11 @@ def run_distributed(state):
                  extra_args.extend(["-c", str(state.context_size)])
 
         elif state.mode == "llama-bench":
-             # Llama Bench specific — separate pp and tg at each context length
              extra_args = [
                  "-mmp", "0",
-                 "-fa", "1"
+                 "-fa", "1",
+                 "-ub", str(state.bench_ubatch),
              ]
-             if state.bench_prefill:
-                 extra_args.extend(["-p", str(state.bench_prefill).strip()])
-             if state.bench_gen:
-                 extra_args.extend(["-n", str(state.bench_gen).strip()])
         else:
              extra_args = []
 
@@ -667,13 +741,40 @@ def run_distributed(state):
                           
         current_extra_args = state.bench_extra_args if state.mode == "llama-bench" else state.extra_args
         if current_extra_args:
-            import shlex
             local_cmd += shlex.split(current_extra_args)
         
-        print(f"CMD: {' '.join(local_cmd)}")
-        
-        proc = subprocess.Popen(local_cmd)
-        proc.wait()
+        if state.mode == "llama-bench":
+            depth_values = ",".join(map(str, bench_depths))
+            benchmark_commands = [
+                (
+                    "Prefill depth curve",
+                    local_cmd + [
+                        "-p", str(DEFAULT_BENCH_PREFILL_CHUNK),
+                        "-n", "0",
+                        "-d", depth_values,
+                    ],
+                ),
+            ]
+            if state.bench_gen:
+                benchmark_commands.append((
+                    "Generation depth curve",
+                    local_cmd + [
+                        "-p", "0",
+                        "-n", str(state.bench_gen).strip(),
+                        "-d", depth_values,
+                    ],
+                ))
+            for label, command in benchmark_commands:
+                print(f"\n=== {label} ===")
+                print(f"CMD: {' '.join(command)}")
+                result = subprocess.run(command)
+                if result.returncode != 0:
+                    print(f"[ERROR] {label} exited with code {result.returncode}")
+                    break
+        else:
+            print(f"CMD: {' '.join(local_cmd)}")
+            proc = subprocess.Popen(local_cmd)
+            proc.wait()
         
     except Exception as e:
         print(f"\n[EXCEPTION] {e}")
@@ -693,7 +794,8 @@ def main_menu():
         if state.mode == "llama-bench":
             p_val = str(state.bench_prefill) if state.bench_prefill else "-"
             n_val = str(state.bench_gen) if state.bench_gen else "-"
-            disp = f"pg P=[{p_val}] N={n_val}"
+            p_count = len([value for value in p_val.split(",") if value != "-"])
+            disp = f"D={p_count} depths N={n_val} UB={state.bench_ubatch}"
             if len(disp) > 30:
                 disp = disp[:27] + "..."
             context_display = disp
@@ -705,6 +807,7 @@ def main_menu():
             run_label = "RUN DISTRIBUTED SERVER"
             
         kv_display = state.kv_cache_quant if state.kv_cache_quant else "Off"
+        rpc_debug_display = "On" if state.rpc_debug else "Off"
         
         current_extra_args = state.bench_extra_args if state.mode == "llama-bench" else state.extra_args
         extra_display = current_extra_args if current_extra_args else "(none)"
@@ -712,7 +815,7 @@ def main_menu():
         menu = [
             "--clear", "--backtitle", "AMD Strix Halo - Distributed Llama",
             "--title", "Main Menu",
-            "--menu", "Select an option to configure or run:", "22", "65", "9",
+            "--menu", "Select an option to configure or run:", "23", "65", "10",
             "1", f"Model:    {model_display}",
             "2", f"Toolbox:  {state.toolbox}",
             "3", f"Servers:  {servers_display}",
@@ -720,8 +823,9 @@ def main_menu():
             "5", f"{context_label}{context_display}",
             "6", f"KV Cache: {kv_display}",
             "7", f"Extra:    {extra_display}",
-            "8", run_label,
-            "9", "Exit"
+            "8", f"RPC Debug: {rpc_debug_display}",
+            "9", run_label,
+            "10", "Exit"
         ]
         
         choice, code = run_dialog(menu)
@@ -744,8 +848,10 @@ def main_menu():
         elif choice == "7":
             edit_extra_args(state)
         elif choice == "8":
-            run_distributed(state)
+            state.rpc_debug = not state.rpc_debug
         elif choice == "9":
+            run_distributed(state)
+        elif choice == "10":
             break
 
         # Persist after every action

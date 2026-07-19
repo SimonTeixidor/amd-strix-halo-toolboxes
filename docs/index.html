@@ -30,6 +30,9 @@
                 <a href="mtp.html" class="chip small legend-pill" style="text-decoration: none; background: #eef9ff; color: #0a517a; border: 1px solid #c7e9ff; font-weight: 600;">
                     ★ View Experimental MTP Benchmarks
                 </a>
+                <a href="ryzen-ai-halo.html" class="chip small legend-pill" style="text-decoration: none; background: #ecfdf3; color: #067647; border: 1px solid #abefc6; font-weight: 600;">
+                    ★ View Ryzen AI Halo Benchmarks
+                </a>
             </div>
         </div>
     </header>
@@ -93,7 +96,7 @@
             <p>These results were produced with two Strix Halo systems (Framework Desktops, each
                 128&nbsp;GB)
                 connected over 50&nbsp;Gbps Ethernet (likely bandwidth is not the limiting factor here, but latency).
-                One runs <code>rpc-server</code> from llama.cpp; the other runs
+                One runs <code>ggml-rpc-server</code> from llama.cpp; the other runs
                 <code>llama-bench --rpc</code>.
             </p>
             <p>This setup allows distributed inference, splitting large GGUF models across both machines. The metric

@@ -32,10 +32,10 @@ ENV ROCM_PATH=/opt/rocm \
   HIP_DEVICE_LIB_PATH=/opt/rocm/amdgcn/bitcode \
   PATH=/opt/rocm/bin:/opt/rocm/llvm/bin:$PATH
 
-# llama.cpp
+# llama.cpp RDMA inline fallback branch
 WORKDIR /opt/llama.cpp
-ARG REPO=https://github.com/charlie12345/rocmfp4-llama.git
-ARG BRANCH=mtp-rocmfp4-strix
+ARG REPO=https://github.com/kyuz0/llama.cpp.git
+ARG BRANCH=fix/rpc-rdma-inline-fallback
 RUN git clone -b ${BRANCH} --single-branch --recursive ${REPO} .
 
 COPY llama-grammar.patch /tmp/llama-grammar.patch
@@ -46,14 +46,11 @@ RUN git clean -xdf \
   && patch -p1 < /tmp/llama-grammar.patch \
   && cmake -S . -B build \
   -DGGML_HIP=ON \
-  -DCMAKE_HIP_ARCHITECTURES=gfx1151 \
-  -DGGML_HIP_FORCE_MMQ=ON \
+  -DAMDGPU_TARGETS=gfx1151 \
   -DCMAKE_BUILD_TYPE=Release \
   -DGGML_RPC=ON \
-  -DLLAMA_BUILD_SERVER=ON \
-  -DLLAMA_BUILD_EXAMPLES=ON \
-  -DLLAMA_BUILD_TESTS=OFF \
-  -DGGML_BUILD_TESTS=OFF \
+  -DLLAMA_HIP_UMA=ON \
+  -DGGML_CUDA_ENABLE_UNIFIED_MEMORY=ON \
   -DROCM_PATH=/opt/rocm \
   -DHIP_PATH=/opt/rocm \
   -DHIP_PLATFORM=amd \
