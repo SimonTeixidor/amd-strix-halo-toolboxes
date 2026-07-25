@@ -29,7 +29,7 @@ jobs:
           IN='${{ inputs.backends }}'
 
           if [[ "$IN" == "all" || -z "$IN" ]]; then
-            JSON='["vulkan-radv-slot-checkpoints"]'
+            JSON='["vulkan-radv-slot-checkpoints","vulkan-radv-cachyllama"]'
           else
             # Remove spaces and build JSON array from comma list
             IN_CLEAN=$(echo "$IN" | tr -d '[:space:]')

@@ -36,7 +36,7 @@ jobs:
         run: |
           IN='${{ github.event.inputs.backends }}'
           if [[ "$IN" == "all" || -z "$IN" ]]; then
-            JSON='["vulkan-radv-slot-checkpoints"]'
+            JSON='["vulkan-radv-slot-checkpoints","vulkan-radv-cachyllama"]'
           else
             IN_CLEAN=$(echo "$IN" | tr -d '[:space:]')
             JSON='["'${IN_CLEAN//,/\",\"}'"]'
