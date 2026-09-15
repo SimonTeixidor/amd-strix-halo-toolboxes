@@ -1,0 +1,288 @@
+# strix-halo-rocm: SimonTeixidor/llama.cpp @ strix-halo-rocm on ROCm 10.0, running on pwilkin's patched
+# ROCr + HIP/CLR (retained PM4 command lists). This is the production image recipe.
+#
+#   ROCr   libhsa-runtime64.so.1.21.0          pwilkin/rocm-systems @ c4b77ac5cb (ilintar-experiments)
+#   HIP    libamdhip64.so.7.16.*-c4b77ac5cb    same commit
+#   SDK    amdrocm-core-devel10.0-gfx1151      stable.repo.amd.com
+#   llama  SimonTeixidor/llama.cpp @ strix-halo-rocm (halo-box/strix-llama.cpp + Strix Halo PRs)
+#
+# Notes on the ROCm 10 layout and the patched runtime build:
+#
+#   * /opt/rocm is a set of alternatives symlinks onto /opt/rocm/core-10.0; there is no lib64, and
+#     core/lib/rocm_sysdeps/lib (bundled libdrm/libelf/libnuma) must be on LD_LIBRARY_PATH.
+#   * HIP/CLR is built with a plain -I on the ROCr include dir so it uses the headers of the exact
+#     ROCr it loads, and with -DLLVM_BIN because ROCM_PATH points at the custom ROCr prefix, which has
+#     no llvm/ (AMD's RPM layout keeps llvm-mc in /opt/rocm/lib/llvm/bin).
+#   * llama.cpp is compiled against the system ROCm 10 SDK; the patched HIP/ROCr are substituted at
+#     load time via LD_LIBRARY_PATH, which the ldd assertions below verify.
+#   * GGML_NATIVE is off so the CPU code does not depend on the build machine; -march=znver5 targets
+#     the Ryzen AI Max (Zen 5) instead.
+#
+#   docker build -f Dockerfile.strix-halo-rocm --build-arg JOBS=16 -t strix-halo-rocm .
+#   docker build ... --build-arg LLAMA_COMMIT=<sha>   # pin a commit (default: branch head)
+
+ARG ROCM_SERIES=10.0
+ARG ROCM_REPO_URL=https://stable.repo.amd.com/rocm/core/packages/rhel10/x86_64
+ARG ROCM_GPG_URL=https://stable.repo.amd.com/rocm/gpg/packages.gpg
+
+ARG ROCM_SYSTEMS_URL=https://github.com/pwilkin/rocm-systems.git
+ARG ROCM_SYSTEMS_BRANCH=ilintar-experiments
+ARG ROCM_SYSTEMS_COMMIT=c4b77ac5cb2879f9dd1f839fac9908b1f5975d64
+
+ARG LLAMA_URL=https://github.com/SimonTeixidor/llama.cpp.git
+ARG LLAMA_BRANCH=strix-halo-rocm
+ARG LLAMA_COMMIT=
+ARG LLAMA_TARGETS="llama-server llama-bench"
+ARG CPU_ARCH=znver5
+
+##############################################################################
+FROM registry.fedoraproject.org/fedora:44 AS builder
+
+ARG ROCM_SERIES
+ARG ROCM_REPO_URL
+ARG ROCM_GPG_URL
+
+RUN printf '%s\n' \
+      '[amdrocm-stable]' \
+      "name=ROCm ${ROCM_SERIES}" \
+      "baseurl=${ROCM_REPO_URL}" \
+      'enabled=1' \
+      'priority=50' \
+      'gpgcheck=1' \
+      "gpgkey=${ROCM_GPG_URL}" \
+      > /etc/yum.repos.d/amdrocm.repo
+
+# install.sh's dnf branch, plus the three packages its apt branch asks for that
+# the dnf branch forgets (libdw, libpciaccess, libudev -- ROCr's CMake looks for
+# all three), plus patch and rdma-core-devel from the ROCm 10.0 toolbox file.
+RUN dnf -y --nodocs --setopt=install_weak_deps=False install \
+      ca-certificates cmake curl elfutils-libelf-devel elfutils-devel gcc gcc-c++ \
+      git-core libcurl-devel libdrm-devel libglvnd-devel libpciaccess-devel \
+      libstdc++-devel libzstd-devel make ninja-build numactl-devel openssl-devel \
+      patch pciutils pkgconf-pkg-config python3 python3-pip python3-devel \
+      rdma-core-devel systemd-devel vim-common zlib-devel \
+      "amdrocm-core-devel${ROCM_SERIES}-gfx1151" \
+    && dnf clean all && rm -rf /var/cache/dnf/*
+
+ENV ROCM_PATH=/opt/rocm \
+    HIP_PATH=/opt/rocm \
+    STRIX_ROOT=/opt/strix \
+    LD_LIBRARY_PATH=/opt/rocm/core/lib/rocm_sysdeps/lib:/opt/rocm/core/lib
+
+# install.sh builds hipcc's header parser into a venv so it never contaminates
+# the system python. Kept, for the same reason.
+RUN python3 -m venv "${STRIX_ROOT}/venv" \
+    && PIP_DISABLE_PIP_VERSION_CHECK=1 "${STRIX_ROOT}/venv/bin/python" -m pip install --upgrade pip \
+    && PIP_DISABLE_PIP_VERSION_CHECK=1 "${STRIX_ROOT}/venv/bin/python" -m pip install 'CppHeaderParser==2.7.4'
+
+# --- sources -----------------------------------------------------------------
+# rocm-systems is a monorepo of ~29 projects; a full checkout is several GiB of
+# things this build never compiles. Sparse-checkout the ones that matter.
+ARG ROCM_SYSTEMS_URL
+ARG ROCM_SYSTEMS_BRANCH
+ARG ROCM_SYSTEMS_COMMIT
+RUN git clone --filter=blob:none --no-checkout --single-branch \
+      --branch "${ROCM_SYSTEMS_BRANCH}" "${ROCM_SYSTEMS_URL}" /usr/src/rocm-systems \
+    && git -C /usr/src/rocm-systems sparse-checkout init --cone \
+    && git -C /usr/src/rocm-systems sparse-checkout set \
+         projects/clr projects/hip projects/hipother projects/rocm-core \
+         projects/rocr-runtime shared \
+    && git -C /usr/src/rocm-systems -c advice.detachedHead=false checkout --detach "${ROCM_SYSTEMS_COMMIT}" \
+    && test "$(git -C /usr/src/rocm-systems rev-parse HEAD)" = "${ROCM_SYSTEMS_COMMIT}"
+
+ARG JOBS=16
+
+# --- 1/3 patched ROCr --------------------------------------------------------
+RUN PATH="${STRIX_ROOT}/venv/bin:${ROCM_PATH}/bin:${ROCM_PATH}/lib/llvm/bin:${PATH}" cmake \
+      -S /usr/src/rocm-systems/projects/rocr-runtime \
+      -B /var/tmp/build/rocr \
+      -G Ninja \
+      -DCMAKE_BUILD_TYPE=Release \
+      -DCMAKE_INSTALL_PREFIX="${STRIX_ROOT}/runtime/rocr" \
+      -DCMAKE_INSTALL_LIBDIR=lib \
+      -DCMAKE_PREFIX_PATH="${ROCM_PATH}" \
+      -DBUILD_SHARED_LIBS=ON \
+    && PATH="${STRIX_ROOT}/venv/bin:${ROCM_PATH}/bin:${ROCM_PATH}/lib/llvm/bin:${PATH}" cmake --build /var/tmp/build/rocr --parallel "${JOBS}" \
+    && PATH="${STRIX_ROOT}/venv/bin:${ROCM_PATH}/bin:${ROCM_PATH}/lib/llvm/bin:${PATH}" cmake --install /var/tmp/build/rocr \
+    && test -e "${STRIX_ROOT}/runtime/rocr/lib/libhsa-runtime64.so.1" \
+    && rm -rf /var/tmp/build/rocr
+
+# --- 2/3 patched HIP / CLR ---------------------------------------------------
+# See the header for why -DLLVM_BIN and the plain -I on the ROCr include dir are
+# both here.
+RUN set -eu; \
+    HIP_BUILD_LIBS="${STRIX_ROOT}/runtime/rocr/lib:${ROCM_PATH}/core/lib/rocm_sysdeps/lib:${ROCM_PATH}/lib:${ROCM_PATH}/lib/llvm/lib"; \
+    export PATH="${STRIX_ROOT}/venv/bin:${ROCM_PATH}/bin:${ROCM_PATH}/lib/llvm/bin:${PATH}"; \
+    test -x "${ROCM_PATH}/lib/llvm/bin/llvm-mc"; \
+    export LD_LIBRARY_PATH="${HIP_BUILD_LIBS}"; \
+    cmake \
+      -S /usr/src/rocm-systems/projects/clr \
+      -B /var/tmp/build/hip \
+      -G Ninja \
+      -DCMAKE_BUILD_TYPE=Release \
+      -DCMAKE_INSTALL_PREFIX="${STRIX_ROOT}/runtime/hip" \
+      -DCMAKE_INSTALL_LIBDIR=lib \
+      -DCMAKE_PREFIX_PATH="${STRIX_ROOT}/runtime/rocr;${ROCM_PATH}" \
+      -DCMAKE_C_FLAGS="-I${STRIX_ROOT}/runtime/rocr/include" \
+      -DCMAKE_CXX_FLAGS="-I${STRIX_ROOT}/runtime/rocr/include" \
+      -DCLR_BUILD_HIP=ON \
+      -DCLR_BUILD_OCL=OFF \
+      -DHIP_PLATFORM=amd \
+      -DHIP_COMMON_DIR=/usr/src/rocm-systems/projects/hip \
+      -DHIPCC_BIN_DIR="${ROCM_PATH}/bin" \
+      -DLLVM_BIN="${ROCM_PATH}/lib/llvm/bin" \
+      -DROCM_PATH="${STRIX_ROOT}/runtime/rocr" \
+      -Dhsa-runtime64_DIR="${STRIX_ROOT}/runtime/rocr/lib/cmake/hsa-runtime64" \
+      -DROCCLR_ENABLE_HSA=ON \
+      -DROCCLR_ENABLE_PAL=OFF \
+      -DHIP_ENABLE_ROCPROFILER_REGISTER=ON \
+      -DUSE_PROF_API=ON \
+      -D__HIP_ENABLE_PCH=ON; \
+    cmake --build /var/tmp/build/hip --parallel "${JOBS}"; \
+    cmake --install /var/tmp/build/hip; \
+    test -e "${STRIX_ROOT}/runtime/hip/lib/libamdhip64.so.7"; \
+    rm -rf /var/tmp/build/hip
+
+# --- 3/3 llama.cpp -----------------------------------------------------------
+ARG LLAMA_URL
+ARG LLAMA_BRANCH
+ARG LLAMA_COMMIT
+ARG LLAMA_TARGETS
+ARG CPU_ARCH
+RUN set -eu; \
+    git clone --filter=blob:none --single-branch --branch "${LLAMA_BRANCH}" "${LLAMA_URL}" /usr/src/llama.cpp; \
+    if [ -n "${LLAMA_COMMIT}" ]; then \
+      git -C /usr/src/llama.cpp -c advice.detachedHead=false checkout --detach "${LLAMA_COMMIT}"; \
+    fi; \
+    git -C /usr/src/llama.cpp log -1 --format='llama.cpp %H %s'
+
+# Built against the SYSTEM ROCm headers; the patched HIP/ROCr are substituted at
+# load time via LD_LIBRARY_PATH, which is what the two ldd assertions below prove.
+RUN PATH="${ROCM_PATH}/bin:${PATH}" ROCM_PATH="${ROCM_PATH}" cmake \
+      -S /usr/src/llama.cpp \
+      -B /var/tmp/build/llama.cpp \
+      -G Ninja \
+      -DCMAKE_BUILD_TYPE=Release \
+      -DCMAKE_PREFIX_PATH="${ROCM_PATH}" \
+      -DCMAKE_C_FLAGS="-march=${CPU_ARCH}" \
+      -DCMAKE_CXX_FLAGS="-march=${CPU_ARCH}" \
+      -DGGML_NATIVE=OFF \
+      -DGGML_HIP=ON \
+      -DGPU_TARGETS=gfx1151 \
+      -DGGML_HIP_GRAPHS=ON \
+      -DGGML_HIP_NO_VMM=ON \
+      -DGGML_HIP_MMQ_MFMA=ON \
+      -DGGML_HIP_RCCL=OFF \
+      -DGGML_CUDA_FA=ON \
+      -DGGML_CUDA_FA_ALL_QUANTS=OFF \
+      -DGGML_VULKAN=OFF \
+      -DLLAMA_CURL=OFF \
+      -DLLAMA_BUILD_TESTS=OFF \
+    && PATH="${ROCM_PATH}/bin:${PATH}" ROCM_PATH="${ROCM_PATH}" cmake \
+         --build /var/tmp/build/llama.cpp --parallel "${JOBS}" \
+         --target ${LLAMA_TARGETS} \
+    && mkdir -p "${STRIX_ROOT}/llama" \
+    && cp -a /var/tmp/build/llama.cpp/bin "${STRIX_ROOT}/llama/bin" \
+    && test -x "${STRIX_ROOT}/llama/bin/llama-server" \
+    && rm -rf /var/tmp/build/llama.cpp
+
+# If these fail the image would silently run on stock ROCm and the retained-PM4 path would be absent.
+RUN set -eu; \
+    RUNTIME_LIBS="${STRIX_ROOT}/runtime/hip/lib:${STRIX_ROOT}/runtime/rocr/lib:${ROCM_PATH}/core/lib/rocm_sysdeps/lib:${ROCM_PATH}/lib:${ROCM_PATH}/lib/llvm/lib:${STRIX_ROOT}/llama/bin"; \
+    out=$(LD_LIBRARY_PATH="${RUNTIME_LIBS}" ldd "${STRIX_ROOT}/llama/bin/libggml-hip.so.0"); \
+    printf '%s\n' "$out"; \
+    printf '%s' "$out" | grep -Fq "${STRIX_ROOT}/runtime/hip/lib/libamdhip64.so" \
+      || { echo 'FAIL: libamdhip64 does not resolve through the custom HIP prefix' >&2; exit 1; }; \
+    printf '%s' "$out" | grep -Fq "${STRIX_ROOT}/runtime/rocr/lib/libhsa-runtime64.so" \
+      || { echo 'FAIL: libhsa-runtime64 does not resolve through the custom ROCr prefix' >&2; exit 1; }
+
+# Record what was built, so a running container can answer "which pins?"
+RUN mkdir -p "${STRIX_ROOT}" && { \
+      echo "llama_repo=${LLAMA_URL}"; \
+      echo "llama_branch=${LLAMA_BRANCH}"; \
+      echo "llama_commit=$(git -C /usr/src/llama.cpp rev-parse HEAD)"; \
+      echo "runtime=patched:pwilkin-rocm-systems"; \
+      echo "runtime_pm4=retained-pm4-present"; \
+      echo "rocm_systems_url=${ROCM_SYSTEMS_URL}"; \
+      echo "rocm_systems_branch=${ROCM_SYSTEMS_BRANCH}"; \
+      echo "rocm_systems_commit=$(git -C /usr/src/rocm-systems rev-parse HEAD)"; \
+      echo "rocm_series=${ROCM_SERIES}"; \
+      echo "rocm_core=$(cat ${ROCM_PATH}/core/.info/version 2>/dev/null || echo unknown)"; \
+      echo "rocm_sdk=$(${ROCM_PATH}/bin/hipconfig --version 2>/dev/null | head -n1)"; \
+      echo "hip_soname=$(basename $(readlink -f ${STRIX_ROOT}/runtime/hip/lib/libamdhip64.so.7))"; \
+      echo "rocr_soname=$(basename $(readlink -f ${STRIX_ROOT}/runtime/rocr/lib/libhsa-runtime64.so.1))"; \
+      echo "built=$(date -u +%Y-%m-%dT%H:%M:%SZ)"; \
+    } > "${STRIX_ROOT}/build-info" \
+    && git -C /usr/src/llama.cpp rev-parse HEAD > "${STRIX_ROOT}/llama-commit"
+
+##############################################################################
+FROM registry.fedoraproject.org/fedora:44
+
+ARG ROCM_SERIES
+ARG ROCM_REPO_URL
+ARG ROCM_GPG_URL
+
+RUN printf '%s\n' \
+      '[amdrocm-stable]' \
+      "name=ROCm ${ROCM_SERIES}" \
+      "baseurl=${ROCM_REPO_URL}" \
+      'enabled=1' \
+      'priority=50' \
+      'gpgcheck=1' \
+      "gpgkey=${ROCM_GPG_URL}" \
+      > /etc/yum.repos.d/amdrocm.repo
+
+# Runtime halves only: no -devel, no LLVM toolchain. amdrocm${SERIES}-gfx1151 is
+# AMD's runtime meta for this arch and carries hipBLAS/rocBLAS, which llama.cpp
+# links. The symlink block from Dockerfile.rocm-10.0 is reproduced but made
+# idempotent: on a full fedora base the RPM's alternatives already provide most
+# of /opt/rocm, and an unconditional `ln -s` would fail.
+RUN dnf -y --nodocs --setopt=install_weak_deps=False install \
+      bash ca-certificates coreutils curl findutils libcurl libdrm libgomp \
+      libatomic libstdc++ libgcc libibverbs numactl-libs pciutils procps-ng \
+      "amdrocm${ROCM_SERIES}-gfx1151" \
+    && dnf clean all && rm -rf /var/cache/dnf/* \
+    && for l in bin include lib libexec share; do \
+         [ -e "/opt/rocm/$l" ] || ln -s "core-${ROCM_SERIES}/$l" "/opt/rocm/$l"; \
+       done \
+    && [ -e /opt/rocm/core ]   || ln -s "core-${ROCM_SERIES}" /opt/rocm/core \
+    && [ -e /opt/rocm/llvm ]   || ln -s "core-${ROCM_SERIES}/lib/llvm" /opt/rocm/llvm \
+    && [ -e /opt/rocm/amdgcn ] || ln -s "core-${ROCM_SERIES}/lib/llvm/amdgcn" /opt/rocm/amdgcn \
+    && test -d /opt/rocm/core/lib/rocm_sysdeps/lib
+
+# LD_LIBRARY_PATH is the load order that makes this image mean anything: the
+# patched HIP and ROCr must precede /opt/rocm or the stock libraries win and the
+# retained-PM4 path is silently absent. ROCm 10 adds core/lib/rocm_sysdeps/lib,
+# which carries the bundled libdrm/libelf/libnuma the runtime needs.
+#
+# DEBUG_HIP_GRAPH_PM4 is a ROCclr `release(bool, ..., false)` flag, parsed BY
+# VALUE -- `-e DEBUG_HIP_GRAPH_PM4=0` cleanly turns the PM4 path off.
+#
+# GGML_CUDA_DISABLE_GRAPHS is deliberately NOT set: ggml reads it by PRESENCE.
+ENV ROCM_PATH=/opt/rocm \
+    HIP_PATH=/opt/rocm \
+    STRIX_ROOT=/opt/strix \
+    STRIX_MODEL_DIR=/models \
+    PATH=/opt/strix/llama/bin:/opt/rocm/bin:/opt/rocm/core/bin:$PATH \
+    LD_LIBRARY_PATH=/opt/strix/runtime/hip/lib:/opt/strix/runtime/rocr/lib:/opt/rocm/core/lib/rocm_sysdeps/lib:/opt/rocm/core/lib:/opt/rocm/core/lib/llvm/lib:/opt/strix/llama/bin \
+    HSA_OVERRIDE_GFX_VERSION=11.5.1 \
+    GGML_HIP_ENABLE_UNIFIED_MEMORY=1 \
+    DEBUG_HIP_GRAPH_PM4=1
+
+COPY --from=builder /opt/strix/runtime /opt/strix/runtime
+COPY --from=builder /opt/strix/llama /opt/strix/llama
+COPY --from=builder /opt/strix/build-info /opt/strix/build-info
+COPY --from=builder /opt/strix/llama-commit /opt/strix/llama-commit
+
+ARG LLAMA_URL
+ARG LLAMA_BRANCH
+ARG ROCM_SYSTEMS_COMMIT
+LABEL org.opencontainers.image.source="https://github.com/SimonTeixidor/amd-strix-halo-toolboxes" \
+      org.strix.llama-repo="${LLAMA_URL}" \
+      org.strix.llama-branch="${LLAMA_BRANCH}" \
+      org.strix.rocm-series="${ROCM_SERIES}" \
+      org.strix.runtime="patched-pwilkin-rocm-systems-${ROCM_SYSTEMS_COMMIT}" \
+      org.strix.retained-pm4=present
+
+VOLUME ["/models"]
+CMD ["/bin/bash"]

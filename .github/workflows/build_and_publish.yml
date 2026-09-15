@@ -1,55 +1,30 @@
-name: Build & Publish AMD Strix Halo Toolboxes
+name: Build & Publish strix-halo-rocm
+
+# Builds the production image: SimonTeixidor/llama.cpp @ strix-halo-rocm on ROCm 10.0 with
+# pwilkin's patched ROCr + HIP (toolboxes/Dockerfile.strix-halo-rocm).
 
 on:
   workflow_dispatch:
     inputs:
-      backends:
-        description: >
-          Comma-separated backends to build (e.g. "rocm-7.2.4-rdma-fix", "rocm-7.2.4-rocmfp4").
-          Use "all" to build everything (defaults to stable branches).
+      llama_commit:
+        description: llama.cpp commit to build (default - head of strix-halo-rocm)
         required: false
-        default: all
+        default: ""
 
 env:
   REGISTRY: ghcr.io
   IMAGE_NAME: amd-strix-halo-toolboxes
-  LOCAL_PREFIX: llama
+  BACKEND: strix-halo-rocm
+  LLAMA_URL: https://github.com/SimonTeixidor/llama.cpp.git
+  LLAMA_BRANCH: strix-halo-rocm
 
 jobs:
-  # 1) Prepare a clean JSON array for the matrix
-  prepare:
-    runs-on: ubuntu-latest
-    outputs:
-      matrix_json: ${{ steps.mk.outputs.matrix_json }}
-    steps:
-      - id: mk
-        shell: bash
-        run: |
-          # Input from the Run workflow form
-          IN='${{ inputs.backends }}'
-
-          if [[ "$IN" == "all" || -z "$IN" ]]; then
-            JSON='["vulkan-radv-slot-checkpoints","vulkan-radv-cachyllama"]'
-          else
-            # Remove spaces and build JSON array from comma list
-            IN_CLEAN=$(echo "$IN" | tr -d '[:space:]')
-            JSON='["'${IN_CLEAN//,/\",\"}'"]'
-          fi
-
-          echo "matrix_json=${JSON}" >> "$GITHUB_OUTPUT"
-          echo "Using matrix: ${JSON}"
-
-  # 2) Build each backend in parallel using the prepared matrix
   build-and-push:
-    needs: prepare
     runs-on: ubuntu-latest
+    timeout-minutes: 360
     permissions:
       contents: read
       packages: write
-    strategy:
-      fail-fast: false
-      matrix:
-        backend: ${{ fromJson(needs.prepare.outputs.matrix_json) }}
 
     steps:
       - name: Free up runner disk space
@@ -74,34 +49,39 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: Compute image repository
+      - name: Resolve llama.cpp commit
+        shell: bash
         run: |
+          set -euo pipefail
+          SHA='${{ inputs.llama_commit }}'
+          if [[ -z "$SHA" ]]; then
+            SHA=$(git ls-remote "$LLAMA_URL" "refs/heads/$LLAMA_BRANCH" | cut -f1)
+          fi
+          [[ -n "$SHA" ]] || { echo "could not resolve $LLAMA_BRANCH"; exit 1; }
+          echo "LLAMA_COMMIT=$SHA" >> "$GITHUB_ENV"
           OWNER="${{ github.repository_owner }}"
           echo "IMAGE_REPO=${REGISTRY}/${OWNER,,}/${IMAGE_NAME}" >> "$GITHUB_ENV"
+          echo "BUILD_TS=$(date +%Y%m%dT%H%M%S)" >> "$GITHUB_ENV"
+          echo "Building $LLAMA_BRANCH @ $SHA"
 
-      - name: Set build timestamp
-        run: echo "BUILD_TS=$(date +%Y%m%dT%H%M%S)" >> $GITHUB_ENV
-
-      - name: Build & push ${{ matrix.backend }}
+      - name: Build & push ${{ env.BACKEND }}
         working-directory: toolboxes
         shell: bash
         run: |
           set -euo pipefail
-          B="${{ matrix.backend }}"
-          DF="Dockerfile.$B"
-          NAME="${B}"
-          LI="${LOCAL_PREFIX}-${NAME}"
-          TAG="${NAME}_${BUILD_TS}"
-          IMM="${IMAGE_REPO}:${TAG}"
-          CHN="${IMAGE_REPO}:${NAME}"
+          LI="llama-${BACKEND}"
+          IMM="${IMAGE_REPO}:${BACKEND}_${BUILD_TS}_${LLAMA_COMMIT:0:9}"
+          CHN="${IMAGE_REPO}:${BACKEND}"
 
-          echo "→ Building ${DF}"
-          docker build --no-cache -t "${LI}" -f "${DF}" .
+          echo "→ Building Dockerfile.${BACKEND}"
+          docker build --no-cache \
+            --build-arg LLAMA_COMMIT="${LLAMA_COMMIT}" \
+            --build-arg JOBS="$(nproc)" \
+            -t "${LI}" -f "Dockerfile.${BACKEND}" .
 
           echo "→ Running smoke test..."
-          docker run --rm "${LI}" bash -c "if command -v llama >/dev/null; then llama version; else llama-cli --version; fi"
-          docker run --rm "${LI}" llama-cli --help || { status=$?; echo "llama-cli exited with status $status"; [[ $status -eq 0 || $status -eq 1 || $status -eq 134 ]]; }
-          docker run --rm "${LI}" llama-server --help || { status=$?; echo "llama-server exited with status $status"; [[ $status -eq 0 || $status -eq 1 || $status -eq 134 ]]; }
+          docker run --rm "${LI}" cat /opt/strix/build-info
+          docker run --rm "${LI}" llama-server --version || { status=$?; echo "llama-server exited with status $status"; [[ $status -eq 0 || $status -eq 1 ]]; }
 
           echo "→ Tag & push immutable → ${IMM}"
           docker tag "${LI}" "${IMM}"

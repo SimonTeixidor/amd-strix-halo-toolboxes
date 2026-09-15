@@ -1,12 +1,8 @@
-name: Poll CachyLLama & Trigger Build
-
-# Mirrors poll-llama-cpp.yaml, but watches fewtarius/CachyLLama (the fork behind
-# the vulkan-radv-cachyllama toolbox) instead of upstream llama.cpp, and rebuilds
-# only that one backend when its default branch advances.
+name: Poll strix-halo-rocm & Trigger Build
 
 on:
   schedule:
-    - cron: '30 */4 * * *'
+    - cron: '0 */4 * * *'
   workflow_dispatch:
 
 permissions:
@@ -23,10 +19,9 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          REPO_URL="https://github.com/fewtarius/CachyLLama.git"
-          DEFAULT_REF=$(git ls-remote --symref "$REPO_URL" HEAD | awk '/^ref:/ {print $2}')
-          echo "📌 Default branch: ${DEFAULT_REF#refs/heads/}"
-          LATEST_SHA=$(git ls-remote "$REPO_URL" "$DEFAULT_REF" | cut -f1)
+          REPO_URL="https://github.com/SimonTeixidor/llama.cpp.git"
+          BRANCH="strix-halo-rocm"
+          LATEST_SHA=$(git ls-remote "$REPO_URL" "refs/heads/$BRANCH" | cut -f1)
           if [[ -z "$LATEST_SHA" ]]; then echo "❌ No SHA found"; exit 1; fi
           echo "✅ Latest SHA: $LATEST_SHA"
           echo "latest_sha=$LATEST_SHA" >> "$GITHUB_OUTPUT"
@@ -38,10 +33,10 @@ jobs:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           set -euo pipefail
-          echo "🔎 Checking for prior artifact 'last-cachyllama-sha'…"
+          echo "🔎 Checking for prior artifact 'last-strix-halo-rocm-sha'…"
           ART_ID=$(curl -fsSL -H "Authorization: Bearer $GH_TOKEN" \
             "https://api.github.com/repos/${GH_REPO}/actions/artifacts?per_page=100" \
-            | jq -r '.artifacts | map(select(.name=="last-cachyllama-sha" and .expired==false)) | sort_by(.created_at) | reverse | .[0].id // empty')
+            | jq -r '.artifacts | map(select(.name=="last-strix-halo-rocm-sha" and .expired==false)) | sort_by(.created_at) | reverse | .[0].id // empty')
           if [[ -n "$ART_ID" ]]; then
             echo "📦 Found artifact id: $ART_ID (downloading)"
             curl -fsSL -H "Authorization: Bearer $GH_TOKEN" -L \
@@ -80,15 +75,16 @@ jobs:
           set -euo pipefail
           WF="build_and_publish.yml"
           REF="main"
-          echo "🚀 Dispatching $WF on $REF (backend: vulkan-radv-cachyllama)…"
+          echo "🚀 Dispatching $WF on $REF…"
           CODE=$(curl -s -o /tmp/resp -w "%{http_code}" \
                  -X POST \
                  -H "Accept: application/vnd.github+json" \
                  -H "Authorization: Bearer $GH_TOKEN" \
-                 -d "{\"ref\":\"$REF\",\"inputs\":{\"backends\":\"vulkan-radv-cachyllama\"}}" \
+                 -d "{\"ref\":\"$REF\",\"inputs\":{\"llama_commit\":\"${{ steps.fetch.outputs.latest_sha }}\"}}" \
                  "https://api.github.com/repos/${{ github.repository }}/actions/workflows/$WF/dispatches")
           echo "HTTP $CODE"
           if [[ "$CODE" != "204" ]]; then echo "Response:"; cat /tmp/resp; exit 1; fi
+          
 
       - name: Save new SHA
         if: steps.compare.outputs.changed == 'true'
@@ -103,6 +99,6 @@ jobs:
         if: steps.compare.outputs.changed == 'true'
         uses: actions/upload-artifact@v4
         with:
-          name: last-cachyllama-sha
+          name: last-strix-halo-rocm-sha
           path: last_commit_sha
           retention-days: 7

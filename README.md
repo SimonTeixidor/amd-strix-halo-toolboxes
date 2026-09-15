@@ -2,6 +2,22 @@
 
 This project provides pre-built containers (“toolboxes”) for running LLMs on **AMD Ryzen AI Max “Strix Halo”** integrated GPUs. Toolbx is the standard developer container system in Fedora (and now works on Ubuntu, openSUSE, Arch, etc).
 
+## This fork: `strix-halo-rocm`
+
+This fork's GitHub Actions build and publish a single image, `ghcr.io/simonteixidor/amd-strix-halo-toolboxes:strix-halo-rocm`, from [`toolboxes/Dockerfile.strix-halo-rocm`](toolboxes/Dockerfile.strix-halo-rocm):
+
+- **llama.cpp**: [SimonTeixidor/llama.cpp](https://github.com/SimonTeixidor/llama.cpp) branch `strix-halo-rocm` ([halo-box/strix-llama.cpp](https://github.com/halo-box/strix-llama.cpp) plus Strix Halo work in progress), HIP backend for gfx1151.
+- **ROCm 10.0** SDK and runtime from `stable.repo.amd.com`.
+- **Patched ROCr and HIP/CLR** built from [pwilkin/rocm-systems](https://github.com/pwilkin/rocm-systems) (`ilintar-experiments`, retained PM4 command lists), loaded ahead of the stock libraries via `LD_LIBRARY_PATH`. `DEBUG_HIP_GRAPH_PM4=1` is set in the image; the build asserts that `libggml-hip` resolves to the patched libraries.
+
+`poll-strix-halo-rocm.yaml` checks the branch every 4 hours and rebuilds when it moves. Each build is pushed as `strix-halo-rocm` and as an immutable `strix-halo-rocm_<timestamp>_<commit>` tag. The binaries are in `/opt/strix/llama/bin` (`llama-server`, `llama-bench`), and `/opt/strix/build-info` records the pins. The other Dockerfiles in `toolboxes/` are no longer built by CI.
+
+```sh
+podman run --rm -it --device /dev/kfd --device /dev/dri --security-opt seccomp=unconfined \
+  -v ~/models:/models:ro -p 8080:8080 ghcr.io/simonteixidor/amd-strix-halo-toolboxes:strix-halo-rocm \
+  llama-server -m /models/<model>.gguf -fa on --load-mode none -ngl 999 --host 0.0.0.0 --port 8080
+```
+
 ---
 
 ### 📦 Project Context
